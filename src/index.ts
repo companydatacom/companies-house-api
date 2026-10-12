@@ -1,32 +1,131 @@
 /**
  * @companydata/companies-house-api
  *
- * A thin, typed convenience wrapper around the CompanyData API for UK Companies House.
- * It is not a separate API: it is the same `@companydata/companydata-sdk`
- * client with the country pinned to GB and a register-specific helper on
- * top, so you can write `client.getByCompanyNumber("...")` instead of assembling
- * query parameters by hand.
+ * A thin, typed convenience wrapper around the CompanyData API for the
+ * UK Companies House register. It is not a separate API: it is the same
+ * `@companydata/companydata-sdk` client with the country pinned to GB
+ * and a register-specific helper on top, so you can write
+ * `client.getByCompanyNumber("00048839")` instead of assembling query parameters.
  *
- * One schema, one key across every CompanyData register.
+ * One schema, one key across every CompanyData register. Swap this package for
+ * another register wrapper and the shape of what you get back does not change.
+ *
+ * Docs: https://companydata.com/api-docs/request-company/
  */
+
 import {
   ApiClient,
   type ApiClientConfig,
   type CompanyExportParams,
-  type CompanyExportScrollResponse,
-  type CompanyExportStandardResponse,
+  type CompanyRecord,
   type CompanySearchParams,
-  type CompanySearchResponse,
   type RequestOptions
 } from "@companydata/companydata-sdk";
 
+/** ISO country code this wrapper is pinned to. */
 export const COUNTRY_CODE = "GB" as const;
 
+/**
+ * Filters accepted by this wrapper: the master SDK's filter set minus
+ * `countryCode`, which is always "GB" here. Use the master SDK directly for
+ * cross-border queries.
+ *
+ * City and province names are matched in UPPER CASE (`cityName: "LONDON"`).
+ */
 export type CompaniesHouseSearchParams = Omit<CompanySearchParams, "countryCode">;
-export type CompaniesHouseExportParams = Omit<CompanyExportParams, "countryCode">;
-export interface CompaniesHouseClientConfig extends ApiClientConfig {}
+export type CompaniesHouseExportParams = Omit<CompanyExportParams, "countryCode" | "useScroll">;
+export type CompaniesHouseClientConfig = ApiClientConfig;
 
-/** Client for UK Companies House data. */
+/** One page of results. Pagination fields are flattened from the API's `meta` block. */
+export interface CompaniesHousePage {
+  records: CompanyRecord[];
+  totalCount: number;
+  page: number;
+  totalPages: number;
+  pageSize: number;
+}
+
+/** One batch of a scroll export. Pass `scrollId` back in to fetch the next batch. */
+export interface CompaniesHouseScrollBatch {
+  records: CompanyRecord[];
+  scrollId: string | null;
+  hasMoreRecords: boolean;
+  pageSize: number;
+}
+
+/** Options for `iterate()`. The API returns at most 50 records per scroll batch. */
+export interface CompaniesHouseIterateOptions {
+  /** Records per request. Capped server-side at 50. */
+  pageSize?: number;
+  /** Stop after this many records. Omit to pull the whole result set. */
+  maxRecords?: number;
+}
+
+type RawMeta = {
+  totalCount?: number;
+  currentPage?: number;
+  totalPages?: number;
+  pageSize?: number;
+  scrollId?: string;
+  hasMoreRecords?: boolean;
+  recordCount?: number;
+};
+
+type RawResponse = {
+  meta?: RawMeta;
+  data?: CompanyRecord[] | { records?: CompanyRecord[]; totalCount?: number };
+  page?: number;
+  pageSize?: number;
+  totalPages?: number;
+  totalCount?: number;
+  scrollId?: string;
+  hasMoreRecords?: boolean;
+};
+
+function recordsOf(res: RawResponse): CompanyRecord[] {
+  if (Array.isArray(res.data)) return res.data;
+  return res.data?.records ?? [];
+}
+
+function toPage(res: RawResponse): CompaniesHousePage {
+  const records = recordsOf(res);
+  const meta = res.meta ?? {};
+  const dataTotal = !Array.isArray(res.data) ? res.data?.totalCount : undefined;
+  return {
+    records,
+    totalCount: meta.totalCount ?? res.totalCount ?? dataTotal ?? records.length,
+    page: meta.currentPage ?? res.page ?? 1,
+    totalPages: meta.totalPages ?? res.totalPages ?? 1,
+    pageSize: meta.pageSize ?? res.pageSize ?? records.length
+  };
+}
+
+function toBatch(res: RawResponse): CompaniesHouseScrollBatch {
+  const records = recordsOf(res);
+  const meta = res.meta ?? {};
+  return {
+    records,
+    scrollId: meta.scrollId ?? res.scrollId ?? null,
+    hasMoreRecords: meta.hasMoreRecords ?? res.hasMoreRecords ?? false,
+    pageSize: meta.pageSize ?? res.pageSize ?? records.length
+  };
+}
+
+/** Normalise a company number to the form the API indexes. */
+export function normalizeCompaniesHouseId(id: string): string {
+  const clean = id.replace(/\s+/g, "").toUpperCase();
+  return /^\d+$/.test(clean) ? clean.padStart(8, "0") : clean;
+}
+
+/**
+ * Client for UK company data from the UK Companies House register.
+ *
+ * ```ts
+ * const client = new CompaniesHouseClient({ auth: { type: "apiKey", apiKey: process.env.COMPANYDATA_API_KEY! } });
+ * const company = await client.getByCompanyNumber("00048839");
+ * const page = await client.search({ cityName: "LONDON", hasEmail: true });
+ * ```
+ */
 export class CompaniesHouseClient {
   private readonly api: ApiClient;
 
@@ -34,38 +133,89 @@ export class CompaniesHouseClient {
     this.api = new ApiClient(config);
   }
 
-  /** Search businesses. `countryCode` is fixed to "GB". */
-  search(params: CompaniesHouseSearchParams = {}, options?: RequestOptions): Promise<CompanySearchResponse> {
-    return this.api.company.search({ ...params, countryCode: COUNTRY_CODE }, options);
+  /** Search UK businesses. `countryCode` is fixed to "GB". */
+  async search(params: CompaniesHouseSearchParams = {}, options?: RequestOptions): Promise<CompaniesHousePage> {
+    const res = await this.api.company.search({ ...params, countryCode: COUNTRY_CODE }, options);
+    return toPage(res as RawResponse);
   }
 
-  /** Look up one business by its company number. Returns the first match, or null. */
-  async getByCompanyNumber(id: string, options?: RequestOptions): Promise<Record<string, unknown> | null> {
-    const clean = id.replace(/\s+/g, "");
-    const response = await this.api.company.search(
-      { nationalId: clean, countryCode: COUNTRY_CODE, pageSize: 1 },
-      options
-    );
-    const records = Array.isArray(response.data) ? response.data : (response.data?.records ?? []);
-    return records[0] ?? null;
+  /**
+   * Look up a single business by the 8-character Companies House company number.
+   * Returns the first matching record, or `null` if none is found.
+   *
+   * `scope` narrows the lookup with any other filter (for example
+   * `{ regionName: "..." }` or `{ cityName: "..." }`) when a number is not
+   * unique on its own.
+   */
+  async getByCompanyNumber(
+    id: string,
+    scope: CompaniesHouseSearchParams = {},
+    options?: RequestOptions
+  ): Promise<CompanyRecord | null> {
+    const page = await this.search({ ...scope, nationalId: normalizeCompaniesHouseId(id), pageSize: 1 }, options);
+    return page.records[0] ?? null;
   }
 
-  /** Export a page of results (standard pagination). */
-  export(params: CompaniesHouseExportParams = {}, options?: RequestOptions): Promise<CompanyExportStandardResponse> {
-    return this.api.company.export({ ...params, countryCode: COUNTRY_CODE }, options);
+  /** Export one page of UK businesses (standard pagination). */
+  async export(params: CompaniesHouseExportParams = {}, options?: RequestOptions): Promise<CompaniesHousePage> {
+    const res = await this.api.company.export({ ...params, countryCode: COUNTRY_CODE }, options);
+    return toPage(res as RawResponse);
   }
 
-  /** Export large sets page by page in scroll mode. */
-  exportWithScroll(params: Omit<CompaniesHouseExportParams, "useScroll"> = {}, options?: RequestOptions): Promise<CompanyExportScrollResponse> {
-    return this.api.company.exportWithScroll({ ...params, countryCode: COUNTRY_CODE }, options);
+  /**
+   * Export in scroll mode. Call once with your filters, then keep calling with
+   * the returned `scrollId` (and the same filters) until `hasMoreRecords` is
+   * false. The API returns at most 50 records per batch. `iterate()` does this
+   * loop for you.
+   */
+  async exportWithScroll(
+    params: CompaniesHouseExportParams & { scrollId?: string } = {},
+    options?: RequestOptions
+  ): Promise<CompaniesHouseScrollBatch> {
+    const res = await this.api.company.exportWithScroll({ ...params, countryCode: COUNTRY_CODE }, options);
+    return toBatch(res as RawResponse);
   }
 
-  /** Escape hatch: the underlying master SDK client. */
+  /**
+   * Stream every record that matches `params`, batch by batch, as an async
+   * iterator. Set `maxRecords` to cap the pull.
+   *
+   * ```ts
+   * for await (const company of client.iterate({ cityName: "LONDON", hasEmail: true }, { maxRecords: 500 })) {
+   *   console.log(company["Company Name"]);
+   * }
+   * ```
+   */
+  async *iterate(
+    params: CompaniesHouseSearchParams = {},
+    opts: CompaniesHouseIterateOptions = {},
+    options?: RequestOptions
+  ): AsyncGenerator<CompanyRecord, void, undefined> {
+    const pageSize = opts.pageSize ?? 50;
+    let scrollId: string | undefined;
+    let yielded = 0;
+    for (;;) {
+      const batch = await this.exportWithScroll(
+        scrollId ? { ...params, scrollId, pageSize } : { ...params, pageSize },
+        options
+      );
+      for (const record of batch.records) {
+        if (opts.maxRecords !== undefined && yielded >= opts.maxRecords) return;
+        yielded += 1;
+        yield record;
+      }
+      if (!batch.hasMoreRecords || batch.records.length === 0 || !batch.scrollId) return;
+      scrollId = batch.scrollId;
+    }
+  }
+
+  /** Escape hatch: the underlying master SDK client, for anything not wrapped here. */
   get raw(): ApiClient {
     return this.api;
   }
 }
 
+/** Convenience factory, if you prefer a function to `new`. */
 export function createCompaniesHouseClient(config: CompaniesHouseClientConfig): CompaniesHouseClient {
   return new CompaniesHouseClient(config);
 }
@@ -73,9 +223,10 @@ export function createCompaniesHouseClient(config: CompaniesHouseClientConfig): 
 export { ApiError } from "@companydata/companydata-sdk";
 export type {
   ApiClientConfig,
-  CompanyExportScrollResponse,
-  CompanyExportStandardResponse,
+  CompanyExportParams,
+  CompanyFilters,
   CompanyRecord,
-  CompanySearchResponse,
+  CompanySearchParams,
+  RangeFilter,
   RequestOptions
 } from "@companydata/companydata-sdk";
